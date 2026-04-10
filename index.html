@@ -1,74 +1,66 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>AR Friend Tracker</title>
-  <style>
-    body { margin: 0; overflow: hidden; }
-    video { position: absolute; width: 100%; height: 100%; object-fit: cover; }
-    canvas { position: absolute; top: 0; left: 0; }
-  </style>
+  <title>Tripwire Multiplayer</title>
 </head>
 <body>
 
-<video id="camera" autoplay playsinline></video>
-<canvas id="overlay"></canvas>
+<h2>Tripwire System</h2>
+
+<label>Name: <input id="name"></label><br>
+<label>Radius (m): <input id="radius" value="10"></label><br>
+<button onclick="createTripwire()">Create Tripwire</button>
+
+<h3 id="status">Connecting...</h3>
 
 <script>
-const video = document.getElementById("camera");
-const canvas = document.getElementById("overlay");
-const ctx = canvas.getContext("2d");
+const ws = new WebSocket("ws://localhost:3000");
 
-canvas.width = window.innerWidth;
-canvas.height = window.innerHeight;
+let myId = null;
+let tripwires = [];
 
-// CAMERA
-navigator.mediaDevices.getUserMedia({ video: true })
-  .then(stream => video.srcObject = stream)
-  .catch(err => alert("Camera permission denied"));
-
-// YOUR LOCATION
-let myLat = 0, myLng = 0;
-
-navigator.geolocation.watchPosition(pos => {
-  myLat = pos.coords.latitude;
-  myLng = pos.coords.longitude;
-});
-
-// FAKE FRIEND LOCATION (replace with server data)
-let friend = {
-  name: "Friend",
-  lat: 47.6205,
-  lng: -122.3493
+ws.onopen = () => {
+  document.getElementById("status").innerText = "Connected";
 };
 
-// SIMPLE DIRECTION CALC
-function getDirection() {
-  let dx = friend.lng - myLng;
-  let dy = friend.lat - myLat;
+ws.onmessage = (msg) => {
+  const data = JSON.parse(msg.data);
 
-  return {
-    x: canvas.width / 2 + dx * 100000,
-    y: canvas.height / 2 - dy * 100000
-  };
+  if (data.type === "init") {
+    myId = data.id;
+    tripwires = data.tripwires;
+  }
+
+  if (data.type === "tripwire_list") {
+    tripwires = data.tripwires;
+  }
+
+  if (data.type === "trigger") {
+    alert(`🚨 ${data.user} triggered ${data.name}`);
+  }
+};
+
+// SEND LOCATION
+navigator.geolocation.watchPosition(pos => {
+  ws.send(JSON.stringify({
+    type: "location",
+    lat: pos.coords.latitude,
+    lng: pos.coords.longitude
+  }));
+});
+
+// CREATE TRIPWIRE
+function createTripwire() {
+  navigator.geolocation.getCurrentPosition(pos => {
+    ws.send(JSON.stringify({
+      type: "tripwire",
+      name: document.getElementById("name").value || "Tripwire",
+      lat: pos.coords.latitude,
+      lng: pos.coords.longitude,
+      radius: parseFloat(document.getElementById("radius").value)
+    }));
+  });
 }
-
-// DRAW LOOP
-function draw() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  let pos = getDirection();
-
-  ctx.fillStyle = "red";
-  ctx.beginPath();
-  ctx.arc(pos.x, pos.y, 10, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillText(friend.name, pos.x + 12, pos.y);
-
-  requestAnimationFrame(draw);
-}
-
-draw();
 </script>
 
 </body>
