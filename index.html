@@ -1,66 +1,120 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Tripwire Multiplayer</title>
+  <title>Motion Detection</title>
+  <style>
+    body { margin: 0; background: black; overflow: hidden; }
+    video, canvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    #box {
+      position: absolute;
+      border: 3px solid lime;
+      pointer-events: none;
+    }
+    #ui {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      z-index: 10;
+      font-family: sans-serif;
+    }
+  </style>
 </head>
 <body>
 
-<h2>Tripwire System</h2>
+<div id="ui">
+  Sensitivity: <input type="range" id="sens" min="10" max="200" value="50"><br>
+  <span id="status">No motion</span>
+</div>
 
-<label>Name: <input id="name"></label><br>
-<label>Radius (m): <input id="radius" value="10"></label><br>
-<button onclick="createTripwire()">Create Tripwire</button>
-
-<h3 id="status">Connecting...</h3>
+<video id="video" autoplay playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="box"></div>
 
 <script>
-const ws = new WebSocket("ws://localhost:3000");
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
 
-let myId = null;
-let tripwires = [];
+const box = document.getElementById("box");
+const statusText = document.getElementById("status");
+const sensitivitySlider = document.getElementById("sens");
 
-ws.onopen = () => {
-  document.getElementById("status").innerText = "Connected";
-};
+let prevFrame = null;
 
-ws.onmessage = (msg) => {
-  const data = JSON.parse(msg.data);
+// Set detection area (center box)
+function updateBox() {
+  const w = window.innerWidth * 0.4;
+  const h = window.innerHeight * 0.4;
+  const x = (window.innerWidth - w) / 2;
+  const y = (window.innerHeight - h) / 2;
 
-  if (data.type === "init") {
-    myId = data.id;
-    tripwires = data.tripwires;
-  }
+  box.style.left = x + "px";
+  box.style.top = y + "px";
+  box.style.width = w + "px";
+  box.style.height = h + "px";
 
-  if (data.type === "tripwire_list") {
-    tripwires = data.tripwires;
-  }
-
-  if (data.type === "trigger") {
-    alert(`🚨 ${data.user} triggered ${data.name}`);
-  }
-};
-
-// SEND LOCATION
-navigator.geolocation.watchPosition(pos => {
-  ws.send(JSON.stringify({
-    type: "location",
-    lat: pos.coords.latitude,
-    lng: pos.coords.longitude
-  }));
-});
-
-// CREATE TRIPWIRE
-function createTripwire() {
-  navigator.geolocation.getCurrentPosition(pos => {
-    ws.send(JSON.stringify({
-      type: "tripwire",
-      name: document.getElementById("name").value || "Tripwire",
-      lat: pos.coords.latitude,
-      lng: pos.coords.longitude,
-      radius: parseFloat(document.getElementById("radius").value)
-    }));
-  });
+  return { x, y, w, h };
 }
+
+let area = updateBox();
+window.onresize = () => area = updateBox();
+
+// CAMERA
+navigator.mediaDevices.getUserMedia({ video: true })
+  .then(stream => video.srcObject = stream)
+  .catch(() => alert("Camera access denied"));
+
+function detectMotion() {
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  ctx.drawImage(video, 0, 0);
+
+  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  if (prevFrame) {
+    let diff = 0;
+
+    const { x, y, w, h } = area;
+
+    for (let i = 0; i < frame.data.length; i += 4) {
+      const px = (i / 4) % canvas.width;
+      const py = Math.floor((i / 4) / canvas.width);
+
+      // Only check inside detection box
+      if (px < x || px > x + w || py < y || py > y + h) continue;
+
+      const rDiff = Math.abs(frame.data[i] - prevFrame.data[i]);
+      const gDiff = Math.abs(frame.data[i+1] - prevFrame.data[i+1]);
+      const bDiff = Math.abs(frame.data[i+2] - prevFrame.data[i+2]);
+
+      const total = rDiff + gDiff + bDiff;
+
+      if (total > sensitivitySlider.value) {
+        diff++;
+      }
+    }
+
+    if (diff > 500) {
+      statusText.innerText = "🚨 MOTION DETECTED";
+      box.style.borderColor = "red";
+    } else {
+      statusText.innerText = "No motion";
+      box.style.borderColor = "lime";
+    }
+  }
+
+  prevFrame = frame;
+  requestAnimationFrame(detectMotion);
+}
+
+video.addEventListener("play", detectMotion);
 </script>
 
 </body>
