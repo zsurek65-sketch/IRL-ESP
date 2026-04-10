@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>ESP Vision: Skeleton Locator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+        }
+
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Segoe UI', 'Poppins', 'Inter', system-ui, -apple-system, sans-serif;
+            touch-action: none; /* prevents pull-to-refresh and panning on canvas */
+        }
+
+        /* Main container: camera view + AR overlay */
+        .ar-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            background: #0a0f1e;
+        }
+
+        /* Camera feed */
+        #cameraFeed {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 1;
+            transform: scaleX(1);
+        }
+
+        /* Canvas for skeleton overlay & location indicators */
+        #overlayCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            pointer-events: none; /* allow touching camera buttons if needed */
+        }
+
+        /* UI Panel - HUD style */
+        .hud {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            right: 0;
+            z-index: 10;
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            padding: 12px 20px;
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(12px);
+            border-radius: 48px;
+            margin: 0 auto;
+            width: fit-content;
+            pointer-events: auto;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            box-shadow: 0 0 15px rgba(0, 200, 255, 0.2);
+        }
+
+        button {
+            background: rgba(20, 30, 55, 0.9);
+            border: none;
+            color: cyan;
+            font-weight: bold;
+            padding: 10px 20px;
+            border-radius: 40px;
+            font-size: 1rem;
+            backdrop-filter: blur(4px);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: monospace;
+            letter-spacing: 1px;
+            border: 1px solid rgba(0, 255, 255, 0.6);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        button:active {
+            transform: scale(0.96);
+            background: cyan;
+            color: black;
+        }
+
+        .status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            right: 20px;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(8px);
+            padding: 8px 16px;
+            border-radius: 32px;
+            color: #0ff;
+            font-size: 0.8rem;
+            z-index: 10;
+            font-family: monospace;
+            font-weight: bold;
+            text-align: center;
+            border-left: 4px solid cyan;
+            pointer-events: none;
+            white-space: nowrap;
+            overflow-x: auto;
+            text-overflow: ellipsis;
+        }
+
+        .contact-badge {
+            position: absolute;
+            bottom: 100px;
+            right: 20px;
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(12px);
+            padding: 8px 14px;
+            border-radius: 28px;
+            color: #ffcc44;
+            font-size: 0.75rem;
+            font-family: monospace;
+            z-index: 10;
+            border: 1px solid gold;
+            pointer-events: none;
+            font-weight: bold;
+        }
+
+        @keyframes pulse {
+            0% { text-shadow: 0 0 0px cyan; opacity: 0.8; }
+            100% { text-shadow: 0 0 8px cyan; opacity: 1; }
+        }
+
+        .glow-text {
+            animation: pulse 1.2s infinite alternate;
+        }
+
+        @media (max-width: 600px) {
+            button { padding: 6px 14px; font-size: 0.8rem; }
+            .status { font-size: 0.65rem; white-space: normal; text-align: left; }
+        }
+    </style>
+</head>
+<body>
+<div class="ar-container">
+    <video id="cameraFeed" autoplay playsinline muted></video>
+    <canvas id="overlayCanvas"></canvas>
+    <div class="hud">
+        <button id="reqLocationBtn">📍 UPDATE MY LOCATION</button>
+        <button id="toggleContactBtn">👤 SWITCH TARGET</button>
+    </div>
+    <div class="status" id="statusMsg">
+        🔍 REQUESTING PERMISSIONS...
+    </div>
+    <div class="contact-badge" id="contactBadge">
+        🎯 TARGET: <span id="targetName">ALEX</span>
+    </div>
+</div>
+
+<script>
+    (function(){
+        // ---------- REALISTIC ESP SIMULATION ----------
+        // Since actual other people's live location data requires backend / API,
+        // this demo showcases a realistic "AR skeleton tracker" that simulates
+        // a selected contact moving in real-time relative to YOUR GPS location.
+        // It uses device location + heading (compass) to overlay a 3D-style skeleton
+        // model in camera space, exactly like a "Real Life ESP" concept.
+        
+        // --- Predefined Contacts (simulated dynamic positions) ---
+        const CONTACTS = [
+            { name: "ALEX", color: "#00ffff", offsetLat: 0.00035, offsetLng: -0.00042, altitude: 1.6 },
+            { name: "JORDAN", color: "#ff44cc", offsetLat: -0.00028, offsetLng: 0.00055, altitude: 1.75 },
+            { name: "SAM", color: "#66ff66", offsetLat: 0.00052, offsetLng: 0.00020, altitude: 1.68 }
+        ];
+        
+        let currentContactIndex = 0;      // start with ALEX
+        let targetContact = CONTACTS[currentContactIndex];
+        
+        // Device state
+        let userLat = null;
+        let userLng = null;
+        let userHeading = 0;       // compass heading in degrees (0 = north)
+        let deviceMotionReady = false;
+        
+        // Camera / canvas references
+        const video = document.getElementById('cameraFeed');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+        let ctx = overlayCanvas.getContext('2d');
+        
+        // Permission flags
+        let cameraActive = false;
+        let locationActive = false;
+        let compassActive = false;
+        
+        // For smooth heading updates (optional filter)
+        let lastHeading = 0;
+        
+        // Animation frame ID
+        let animationId = null;
+        
+        // Simulated "contact walk" - adds dynamic movement to make it feel alive
+        let timeOffset = 0;
+        let lastTimestamp = 0;
+        
+        // ---- Helper: update UI text ----
+        function updateStatus(message, isError = false) {
+            const statusDiv = document.getElementById('statusMsg');
+            if(statusDiv) {
+                statusDiv.innerHTML = message;
+                if(isError) statusDiv.style.borderLeftColor = "#ff5555";
+                else statusDiv.style.borderLeftColor = "#0ff";
+            }
+        }
+        
+        function updateContactBadge() {
+            document.getElementById('targetName').innerText = targetContact.name;
+            const badge = document.getElementById('contactBadge');
+            badge.style.borderColor = targetContact.color;
+            badge.style.color = targetContact.color;
+        }
+        
+        // ---- Geolocation + Compass (Absolute Location & Orientation) ----
+        function requestLocationAndCompass() {
+            // Request GPS
+            if (navigator.geolocation) {
+                navigator.geolocation.watchPosition(
+                    (position) => {
+                        userLat = position.coords.latitude;
+                        userLng = position.coords.longitude;
+                        locationActive = true;
+                        updateStatus(`📍 GPS LOCKED: ${userLat.toFixed(5)}, ${userLng.toFixed(5)} | Heading: ${Math.round(userHeading)}°`);
+                    },
+                    (err) => {
+                        console.warn(err);
+                        updateStatus(`⚠️ GPS ERROR: ${err.message}. Using simulated demo location.`, true);
+                        // fallback: set a mock location (Seattle area)
+                        userLat = 47.6062;
+                        userLng = -122.3321;
+                        locationActive = true;
+                    },
+                    { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+                );
+            } else {
+                updateStatus("❌ Geolocation not supported. Using mock location.", true);
+                userLat = 47.6062;
+                userLng = -122.3321;
+                locationActive = true;
+            }
+            
+            // Request DeviceOrientation for compass heading (alpha)
+            if (window.DeviceOrientationEvent) {
+                // For iOS 13+ we need user permission request
+                if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    // We'll ask on button or on body click? Better to attach to a gesture.
+                    // Since we already have user interaction by clicking the button, we can
+                    // call a separate function, but to simplify we ask on any touch start on document.
+                    document.body.addEventListener('touchstart', requestCompassPermissioniOS, { once: true });
+                    document.body.addEventListener('click', requestCompassPermissioniOS, { once: true });
+                    updateStatus("📍 Tap screen to allow compass access for AR overlay.");
+                } else {
+                    // Android / standard
+                    window.addEventListener('deviceorientationabsolute', handleOrientation);
+                    window.addEventListener('deviceorientation', handleOrientation);
+                    compassActive = true;
+                }
+            } else {
+                console.warn("No device orientation");
+                userHeading = 0;
+            }
+        }
+        
+        function requestCompassPermissioniOS() {
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission()
+                    .then(permissionState => {
+                        if (permissionState === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation);
+                            compassActive = true;
+                            updateStatus(`✅ Compass granted! GPS & AR ready.`);
+                        } else {
+                            updateStatus(`⚠️ Compass denied. Skeleton will use relative rotation.`);
+                        }
+                    })
+                    .catch(err => {
+                        console.error(err);
+                        updateStatus(`Compass error: ${err}`);
+                    });
+            }
+        }
+        
+        function handleOrientation(event) {
+            // alpha: compass heading (0-360) relative to north
+            let alpha = event.alpha;
+            if (alpha !== null && !isNaN(alpha)) {
+                // webkit compass normalization
+                let heading = alpha;
+                if (event.webkitCompassHeading !== undefined) {
+                    heading = event.webkitCompassHeading;
+                }
+                userHeading = heading;
+                lastHeading = heading;
+                // update status periodically but not spammy
+                if (locationActive) {
+                    updateStatus(`📍 GPS: ${userLat?.toFixed(4)} , ${userLng?.toFixed(4)} | 🧭 Heading: ${Math.round(userHeading)}°`);
+                }
+            }
+        }
+        
+        // ---- Camera Access (Real Camera for AR background) ----
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } } 
+                });
+                video.srcObject = stream;
+                await video.play();
+                cameraActive = true;
+                updateStatus(`📷 Camera active | AR ESP ready.`);
+            } catch (err) {
+                console.error("Camera error", err);
+                updateStatus(`❌ Camera permission denied. Using placeholder black background.`, true);
+                cameraActive = false;
+                // Draw a grid fallback on canvas anyway
+            }
+        }
+        
+        // ---- Compute contact's real-world offset relative to user ----
+        // Returns { dx, dy, distance, azimuth } in meters & angle from user heading
+        function computeRelativePosition(contact) {
+            if (!userLat || !userLng) return null;
+            
+            // Simulate dynamic motion: each contact moves slightly based on time and unique seed
+            // To make it feel like "real life ESP", contacts drift realistically within ~15 meter radius
+            const t = performance.now() / 1000;
+            // unique movement per contact index
+            const idx = CONTACTS.findIndex(c => c.name === contact.name);
+            const phaseX = idx * 2.3;
+            const phaseY = idx * 1.7;
+            // dynamic offset in meters (lat/lng degree ~ 111111 m)
+            const dynamicOffsetMetersX = Math.sin(t * 0.4 + phaseX) * 8.0;   // meters east-west
+            const dynamicOffsetMetersY = Math.cos(t * 0.35 + phaseY) * 6.0;   // meters north-south
+            
+            // base static offset (in degrees) from contact config, converted to meters
+            const baseDeltaLatDeg = contact.offsetLat;      // degrees latitude
+            const baseDeltaLngDeg = contact.offsetLng;      // degrees longitude
+            // convert to meters (approx)
+            const metersPerDegLat = 111320;
+            const metersPerDegLng = 111320 * Math.cos(userLat * Math.PI / 180);
+            let baseNorthM = baseDeltaLatDeg * metersPerDegLat;
+            let baseEastM = baseDeltaLngDeg * metersPerDegLng;
+            
+            // add dynamic drift
+            let totalNorthM = baseNorthM + dynamicOffsetMetersY;
+            let totalEastM = baseEastM + dynamicOffsetMetersX;
+            
+            // compute distance & bearing (radians)
+            let distance = Math.hypot(totalNorthM, totalEastM);
+            let bearingRad = Math.atan2(totalEastM, totalNorthM); // 0 = north, positive east
+            let bearingDeg = (bearingRad * 180 / Math.PI + 360) % 360;
+            
+            // convert to azimuth relative to user heading: angle on screen (0 = front)
+            let relativeAngle = bearingDeg - userHeading;
+            relativeAngle = (relativeAngle + 360) % 360;
+            // Convert to angle where 0° = straight ahead, positive to right
+            let screenAngleRad = relativeAngle * Math.PI / 180;
+            
+            return {
+                distanceMeters: distance,
+                azimuthDeg: bearingDeg,
+                relativeAngleDeg: relativeAngle,
+                screenAngleRad: screenAngleRad,
+                lateralMeters: totalEastM,
+                forwardMeters: totalNorthM,
+                altitudeMeters: contact.altitude // typical standing height 1.6m
+            };
+        }
+        
+        // ---- Convert world position to 2D canvas coordinates using pinhole camera approximation ----
+        // fov ~ 70 degrees vertical, aspect ratio dependent
+        function worldToScreen(relPos, canvasWidth, canvasHeight, maxVisibleDist = 40.0) {
+            if (!relPos) return null;
+            let distance = relPos.distanceMeters;
+            if (distance < 0.2) distance = 0.2;
+            if (distance > maxVisibleDist) return null; // too far, hidden
+            
+            // angle from center (radians), horizontal field of view ~ 75 deg
+            const hFOV = 75 * Math.PI / 180;
+            const vFOV = 60 * Math.PI / 180;
+            
+            let angleFromCenter = relPos.screenAngleRad; // horizontal offset from center (radians)
+            // Normalize -pi to pi range
+            if (angleFromCenter > Math.PI) angleFromCenter -= 2*Math.PI;
+            // x offset: proportional to tan(angle)/tan(halfFOV)
+            let maxTan = Math.tan(hFOV/2);
+            let normX = Math.tan(angleFromCenter) / maxTan;
+            let screenX = (normX * 0.5 + 0.5) * canvasWidth;
+            
+            // Vertical: target height relative to camera height. Assume camera height ~1.55m (eye level)
+            const cameraHeight = 1.55;   // meters
+            const targetHeight = relPos.altitudeMeters;
+            const verticalOffsetMeters = targetHeight - cameraHeight;
+            // Angle vertical: atan2(verticalOffset, distance)
+            let vertAngle = Math.atan2(verticalOffsetMeters, distance);
+            let maxVertTan = Math.tan(vFOV/2);
+            let normY = Math.tan(vertAngle) / maxVertTan;
+            let screenY = (0.5 - normY * 0.5) * canvasHeight;  // flip Y: up negative in canvas coords
+            
+            // Scale factor based on distance (for skeleton size)
+            let scale = Math.min(1.2, (2.8 / distance) * 1.8);
+            scale = Math.max(0.4, Math.min(1.6, scale));
+            
+            return { x: screenX, y: screenY, distance: distance, scale: scale };
+        }
+        
+        // ---- Draw a "skeleton model" (wireframe human) at given screen coordinates ----
+        function drawSkeleton(ctx, x, y, scale, color, distance) {
+            ctx.save();
+            ctx.shadowBlur = 0;
+            ctx.beginPath();
+            // scale skeleton size relative to distance (larger when close)
+            const bodyHeight = 110 * scale;
+            const headRadius = 14 * scale;
+            const shoulderWidth = 32 * scale;
+            const hipWidth = 28 * scale;
+            
+            // Head
+            ctx.beginPath();
+            ctx.arc(x, y - bodyHeight * 0.35, headRadius, 0, Math.PI * 2);
+            ctx.fillStyle = `${color}55`;
+            ctx.fill();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2.5 * scale;
+            ctx.stroke();
+            // eyes (glow effect)
+            ctx.fillStyle = "#ffffffcc";
+            ctx.beginPath();
+            ctx.arc(x - headRadius*0.4, y - bodyHeight*0.35 - 3*scale, 3*scale, 0, Math.PI*2);
+            ctx.arc(x + headRadius*0.4, y - bodyHeight*0.35 - 3*scale, 3*scale, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = "#00ffff";
+            ctx.beginPath();
+            ctx.arc(x - headRadius*0.4, y - bodyHeight*0.35 - 3*scale, 1.5*scale, 0, Math.PI*2);
+            ctx.arc(x + headRadius*0.4, y - bodyHeight*0.35 - 3*scale, 1.5*scale, 0, Math.PI*2);
+            ctx.fill();
+            
+            // Spine line
+            ctx.beginPath();
+            ctx.moveTo(x, y - bodyHeight * 0.2);
+            ctx.lineTo(x, y + bodyHeight * 0.2);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3 * scale;
+            ctx.stroke();
+            
+            // Shoulders (clavicle line)
+            ctx.beginPath();
+            ctx.moveTo(x - shoulderWidth, y - bodyHeight * 0.1);
+            ctx.lineTo(x + shoulderWidth, y - bodyHeight * 0.1);
+            ctx.stroke();
+            
+            // Arms
+            ctx.beginPath();
+            ctx.moveTo(x - shoulderWidth, y - bodyHeight * 0.1);
+            ctx.lineTo(x - shoulderWidth*0.8, y + bodyHeight * 0.15);
+            ctx.lineTo(x - shoulderWidth*0.5, y + bodyHeight * 0.35);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(x + shoulderWidth, y - bodyHeight * 0.1);
+            ctx.lineTo(x + shoulderWidth*0.8, y + bodyHeight * 0.15);
+            ctx.lineTo(x + shoulderWidth*0.5, y + bodyHeight * 0.35);
+            ctx.stroke();
+            
+            // Hips & legs
+            ctx.beginPath();
+            ctx.moveTo(x, y + bodyHeight * 0.2);
+            ctx.lineTo(x, y + bodyHeight * 0.5);
+            ctx.lineTo(x - hipWidth*0.7, y + bodyHeight * 0.85);
+            ctx.moveTo(x, y + bodyHeight * 0.5);
+            ctx.lineTo(x + hipWidth*0.7, y + bodyHeight * 0.85);
+            ctx.stroke();
+            
+            // add joint dots
+            ctx.fillStyle = color;
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = color;
+            [[x - shoulderWidth, y - bodyHeight * 0.1], [x + shoulderWidth, y - bodyHeight * 0.1],
+             [x, y + bodyHeight * 0.2], [x - hipWidth*0.7, y + bodyHeight * 0.85], [x + hipWidth*0.7, y + bodyHeight * 0.85]].forEach(j=>{
+                ctx.beginPath();
+                ctx.arc(j[0], j[1], 4*scale, 0, Math.PI*2);
+                ctx.fill();
+            });
+            
+            // Distance label above head
+            ctx.font = `bold ${Math.max(12, 14 * scale)}px monospace`;
+            ctx.fillStyle = "#ffffffdd";
+            ctx.shadowBlur = 0;
+            ctx.fillText(`${Math.round(distance*10)/10}m`, x - 20*scale, y - bodyHeight*0.55);
+            ctx.fillStyle = color;
+            ctx.font = `bold ${Math.max(14, 16 * scale)}px monospace`;
+            ctx.fillText(`${targetContact.name}`, x - 22*scale, y - bodyHeight*0.68);
+            
+            // Pulse ring effect (ESP style)
+            ctx.beginPath();
+            ctx.arc(x, y - bodyHeight * 0.35, headRadius + 5 + Math.sin(Date.now() * 0.008) * 3, 0, Math.PI*2);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.restore();
+        }
+        
+        // ---- Main AR render loop: camera background + skeleton overlay ----
+        function renderFrame() {
+            if (!overlayCanvas || !ctx) return;
+            // resize canvas to match video / screen
+            const container = document.querySelector('.ar-container');
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+            overlayCanvas.width = width;
+            overlayCanvas.height = height;
+            
+            // Clear canvas (transparent to see camera feed)
+            ctx.clearRect(0, 0, width, height);
+            
+            // Draw camera video if active and video ready
+            if (cameraActive && video.readyState >= 2 && video.videoWidth) {
+                // optional: draw video to canvas if we need to manipulate, but we keep as background
+                // We can just not draw; camera layer behind canvas; we only draw skeleton on top.
+                // For better blending: we just keep canvas clear.
+            } else if (!cameraActive) {
+                // fallback: dark grid background with AR style
+                ctx.fillStyle = "#0a0f1ecc";
+                ctx.fillRect(0, 0, width, height);
+                ctx.strokeStyle = "#2a3f5e";
+                ctx.lineWidth = 1;
+                for (let i = 0; i < width; i += 40) {
+                    ctx.beginPath();
+                    ctx.moveTo(i, 0);
+                    ctx.lineTo(i, height);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.moveTo(0, i % height);
+                    ctx.lineTo(width, i % height);
+                    ctx.stroke();
+                }
+            }
+            
+            // Compute relative position for selected target contact
+            if (userLat !== null && userLng !== null && targetContact) {
+                const rel = computeRelativePosition(targetContact);
+                if (rel) {
+                    const screenPos = worldToScreen(rel, width, height, 55.0);
+                    if (screenPos && screenPos.x > -100 && screenPos.x < width + 100 && screenPos.y > -200 && screenPos.y < height + 200) {
+                        drawSkeleton(ctx, screenPos.x, screenPos.y, screenPos.scale, targetContact.color, screenPos.distance);
+                        // Additional "ESP glow"
+                        ctx.shadowBlur = 0;
+                        ctx.font = "12px monospace";
+                        ctx.fillStyle = "#aaffff";
+                        ctx.shadowBlur = 4;
+                        ctx.fillText("⚡ LIVE TRACKING", screenPos.x - 45, screenPos.y - 90);
+                    } else {
+                        // out of frame indicator
+                        ctx.font = "bold 14px monospace";
+                        ctx.fillStyle = "orange";
+                        ctx.shadowBlur = 4;
+                        ctx.fillText(`⚠️ ${targetContact.name} OUT OF VIEW (${Math.round(rel.distanceMeters)}m)`, width/2-120, 60);
+                    }
+                } else {
+                    ctx.fillStyle = "cyan";
+                    ctx.font = "bold 18px monospace";
+                    ctx.fillText("CALCULATING POSITION...", width/2-120, height/2);
+                }
+            } else {
+                ctx.fillStyle = "#ffaa55";
+                ctx.font = "18px monospace";
+                ctx.fillText("📍 WAITING FOR GPS & COMPASS...", width/2-150, height/2);
+            }
+            
+            // Draw crosshair / reticle
+            ctx.beginPath();
+            ctx.strokeStyle = "#0ff8";
+            ctx.lineWidth = 1.5;
+            ctx.moveTo(width/2 - 20, height/2);
+            ctx.lineTo(width/2 - 8, height/2);
+            ctx.moveTo(width/2 + 8, height/2);
+            ctx.lineTo(width/2 + 20, height/2);
+            ctx.moveTo(width/2, height/2 - 20);
+            ctx.lineTo(width/2, height/2 - 8);
+            ctx.moveTo(width/2, height/2 + 8);
+            ctx.lineTo(width/2, height/2 + 20);
+            ctx.stroke();
+            
+            requestAnimationFrame(renderFrame);
+        }
+        
+        // ---- toggle contact ----
+        function switchContact() {
+            currentContactIndex = (currentContactIndex + 1) % CONTACTS.length;
+            targetContact = CONTACTS[currentContactIndex];
+            updateContactBadge();
+            updateStatus(`🎯 TARGET CHANGED: ${targetContact.name} | Tracking active.`);
+        }
+        
+        // ---- manual location refresh (force re-center) ----
+        function refreshLocation() {
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        userLat = pos.coords.latitude;
+                        userLng = pos.coords.longitude;
+                        updateStatus(`📍 LOCATION UPDATED: ${userLat.toFixed(5)}, ${userLng.toFixed(5)}`);
+                    },
+                    (err) => updateStatus(`Location error: ${err.message}`, true),
+                    { enableHighAccuracy: true, timeout: 8000 }
+                );
+            }
+        }
+        
+        // ---- EVENT LISTENERS ----
+        document.getElementById('reqLocationBtn').addEventListener('click', refreshLocation);
+        document.getElementById('toggleContactBtn').addEventListener('click', switchContact);
+        
+        // kickstart everything
+        async function startup() {
+            updateStatus("🚀 INITIALIZING ESP... Requesting camera & location.");
+            await initCamera();
+            requestLocationAndCompass();
+            renderFrame();
+        }
+        
+        startup();
+        // resize handler
+        window.addEventListener('resize', () => {
+            if(overlayCanvas) {
+                overlayCanvas.width = window.innerWidth;
+                overlayCanvas.height = window.innerHeight;
+            }
+        });
+    })();
+</script>
+</body>
+</html>
